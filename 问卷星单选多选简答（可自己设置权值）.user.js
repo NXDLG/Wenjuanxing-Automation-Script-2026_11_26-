@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         问卷星自动随机答题
-// @version      2.2
+// @version      2.3
 // @description  自动随机填写问卷星 vm 版单选问卷并自动提交，无需手动点击；每提交成功一份后自动刷新进入下一份，可无限循环；遇到阿里云安全验证会自动暂停并提示；提交后跳到 completemobile2 等完成页会自动跳回问卷继续
 // @author       原版作者：ZainCheung；本版基于其项目修改
 // @copyright    原版 2019-2020 ZainCheung，Apache License 2.0
@@ -69,8 +69,11 @@
  *   提交太快、同一 IP 提交太多时问卷星会弹这个验证框，不通过就提交不上去。
  *   · 如果是“点一下就变绿”的无感验证：脚本会自动点那个小方块（最多 captchaRetry 次），
  *     变绿后这一份自动提交，接着进入下一份，全程不用你动手；
+ *   · 如果点了没通过：脚本会**自动刷新页面重来**（最多 captchaReloadMax 次）——
+ *     实测刷新之后这一份往往能直接提交成功，比一直点验证框有效；
+ *     把 captchaReloadAfter 设成 0 就是一出现验证就刷新，连点都不点；
  *   · 如果变成要拖滑块/拼图：脚本立刻停手，面板提示你手动拖一下，通过后自动继续。
- *   想少被验证：把 intervalMs / clickCooldownMs 调大，或按 README 用 Modify Headers 换 IP。
+ *   想少被验证：把 intervalMs / clickCooldownMs 调大，或真换出口 IP（热点/宽带重拨）。
  *
  * ============================ 可调参数 ============================
  * CONFIG 里：
@@ -81,6 +84,8 @@
  *   submitRetry       每份最多自动点击「提交」几次（默认 3）
  *   clickCooldownMs   两次自动点击之间的最小间隔（默认 5000 毫秒）
  *   captchaRetry      安全验证最多自动点几次（默认 6，之后转人工）
+ *   captchaReloadAfter 验证点几次没通过就自动刷新页面重来（默认 2；0 = 一出现验证就刷新）
+ *   captchaReloadMax  同一份最多自动刷新几次（默认 3，防止无限刷新）
  *   multiMin          多选最少勾几项（默认 1）
  *   multiMax          多选最多勾几项，0 = 自动取选项数的一半（默认 0）
  *   showPanel         是否显示右下角控制面板（默认 true）
@@ -139,6 +144,11 @@
         clickCooldownMs: 5000,
         // 安全验证（点一下就变绿那种）最多自动点几次，之后转人工
         captchaRetry: 6,
+        // 验证点不过时自动刷新页面重来（实测：刷新之后这一份往往能直接提交成功）
+        // captchaReloadAfter = 点几次没通过就刷新；设为 0 = 一出现验证就刷新，不点
+        captchaReloadAfter: 2,
+        // 同一份答卷最多自动刷新几次，防止无限刷新
+        captchaReloadMax: 3,
         // 多选题勾选数量：最少 multiMin 项；multiMax 为 0 时“上限”取选项数的一半
         // 例：6 个选项的题，multiMin:1 + multiMax:0 → 每份随机勾选 1~3 项；
         //     multiMin:2, multiMax:4 → 随机 2~4 项；multiMin:3, multiMax:3 → 固定 3 项
@@ -227,7 +237,9 @@
         count: 'wjxLoop.submitCount',
         // 提交时打的标记 + 已计过数的标记，用来保证“每一份只计一次”
         pending: 'wjxLoop.pendingRound',
-        countedToken: 'wjxLoop.countedToken'
+        countedToken: 'wjxLoop.countedToken',
+        // 同一份答卷为通过验证而刷新了几次
+        captchaReloads: 'wjxLoop.captchaReloads'
     };
 
     var SUBMIT_SELECTORS = [
@@ -356,6 +368,7 @@
         var token = pending || newRoundToken('manual-');
         bumpCount();
         writeStr(KEY.countedToken, token);
+        writeNum(KEY.captchaReloads, 0); // 这一份完成了，验证刷新次数清零
         return true;
     }
 
@@ -671,6 +684,19 @@
         state.captchaClicks++;
         state.lastCaptchaClick = Date.now();
         return 'clicked';
+    }
+
+    /**
+     * 验证没过 → 刷新页面换一次会话重来。
+     * 实测：验证卡住时刷新一次，这一份往往能直接提交成功，比一直点验证框有效得多。
+     */
+    function reloadToRetry(reloads) {
+        writeNum(KEY.captchaReloads, reloads + 1);
+        state.finished = true; // 刷新前别再点提交
+        setStatus('安全验证没通过，自动刷新页面重试（' + (reloads + 1) + '/' + CONFIG.captchaReloadMax + '）…');
+        setTimeout(function () {
+            location.reload();
+        }, 700);
     }
 
     /* ---------------------- 提交确认弹窗 ---------------------- */
@@ -1107,22 +1133,42 @@
             return;
         }
 
-        // 3) 出现人机验证 → 先尝试自动点掉（无感验证点一下就过），过不了才等人工
+        // 3) 出现人机验证 → 先尝试自动点掉；点不过就刷新页面重来（刷新后这份常能直接过）
         //    只有点过「提交」之后才把验证框当成拦截（问卷星是提交时才弹），
         //    阿里云验证框例外：它一出现就一定是拦截，直接处理。
         var cap = captchaVisible();
         if (cap && (state.attempts > 0 || isAliyunCaptcha(cap))) {
             state.lastClick = Date.now();
+            var reloads = readNum(KEY.captchaReloads, 0);
+            var canReload = reloads < CONFIG.captchaReloadMax;
+
+            // 配成 0：一出现验证就刷新，不尝试点击
+            if (CONFIG.captchaReloadAfter <= 0 && canReload) {
+                reloadToRetry(reloads);
+                return;
+            }
+
             var pass = tryPassCaptcha();
             if (pass === 'clicked') {
                 setStatus('正在自动通过安全验证…');
-            } else if (pass === 'manual') {
-                setStatus('检测到安全验证：这次要拖滑块，请手动完成，脚本会自动继续');
-            } else if (pass === 'exhausted') {
-                setStatus('安全验证没自动通过，请手动点一下验证框，脚本会自动继续');
-            } else {
-                setStatus('正在等待安全验证结果…');
+                return;
             }
+            if (pass === 'manual') {
+                setStatus('检测到安全验证：这次要拖滑块，请手动完成，脚本会自动继续');
+                return;
+            }
+
+            // 点了没通过（还在转圈 / 已点满次数）→ 刷新页面换一次会话
+            if (state.captchaClicks >= CONFIG.captchaReloadAfter) {
+                if (canReload) {
+                    reloadToRetry(reloads);
+                } else {
+                    setStatus('安全验证反复失败，请手动完成验证；换网络后点「暂停」再「继续」可重试');
+                }
+                return;
+            }
+
+            setStatus('正在等待安全验证结果…');
             return;
         }
         state.captchaClicks = 0;
